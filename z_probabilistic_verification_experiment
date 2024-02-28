@@ -1,0 +1,245 @@
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+import torch, torch.nn as nn
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from datetime import datetime
+
+
+def model_predict_fn(state_vector, model_path):
+    # use cuda if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # load the model
+    model_demo = nn.Sequential(
+        nn.Linear(8, 200),
+        nn.SiLU(),
+        nn.Linear(200, 200),
+        nn.SiLU(),
+        nn.Linear(200, 200),
+        nn.SiLU(),
+        nn.Linear(200, 1),
+    )
+    model_demo.load_state_dict(torch.load(model_path))
+    model_demo.eval()
+    prediction = model_demo(torch.tensor(state_vector.astype(np.float32))).detach().numpy()
+    return prediction
+
+def probabilistic_verify(noise_level, samples, tree, model_path, save_path='verification_result.csv'):
+
+    Historical_X = pd.read_csv('data/X_pittsburgh.csv')
+
+    for sample_idx in range(samples):
+        if sample_idx % 200 == 0:
+            print('Sample #{}'.format(sample_idx))
+
+        df = []
+
+        # sample a number from 0 to size of Historical_X - 21 that mod 96 > 31 and mod 96 < 84
+        current_step = np.random.randint(0, Historical_X.shape[0]-21)
+        while current_step % 96 < 31 or current_step % 96 > 84:
+            current_step = np.random.randint(0, Historical_X.shape[0]-21)
+        # get the row of Historical_X at index current_step
+        input_x = Historical_X.iloc[current_step]
+
+        zone_temp = input_x['Zone Air Temperature(SPACE1-1)']
+
+        while zone_temp < 20.0 or zone_temp > 23.5 or current_step % 96 < 31 or current_step % 96 > 84:
+            current_step = np.random.randint(0, Historical_X.shape[0]-21)
+            while current_step % 96 < 31 or current_step % 96 > 84:
+                current_step = np.random.randint(0, Historical_X.shape[0]-21)
+            # get the row of Historical_X at index current_step
+            input_x = Historical_X.iloc[current_step]
+            zone_temp = input_x['Zone Air Temperature(SPACE1-1)']
+
+        people_count = input_x['Zone People Occupant Count(SPACE1-1)']
+
+        noised_input = input_x + np.random.normal(0, noise_level*np.std(input_x, axis=0), input_x.shape)
+        # separate obs and disturbance
+        obs = noised_input['Zone Air Temperature(SPACE1-1)']
+        disturbance = noised_input.drop('Zone Air Temperature(SPACE1-1)')
+        disturbance = disturbance.drop('Zone Thermostat Heating Setpoint Temperature(SPACE1-1)')
+        disturbance = disturbance.drop('Zone Thermostat Cooling Setpoint Temperature(SPACE1-1)')
+
+        '''
+        For any of the 'Site Outdoor Air Relative Humidity(Environment)',
+       'Site Wind Speed(Environment)',
+       'Site Direct Solar Radiation Rate per Area(Environment)',
+        if the value is negative, set it to 0
+        '''
+        disturbance['Site Outdoor Air Relative Humidity(Environment)'] = max(0, disturbance['Site Outdoor Air Relative Humidity(Environment)'])
+        disturbance['Site Wind Speed(Environment)'] = max(0, disturbance['Site Wind Speed(Environment)'])
+        disturbance['Site Direct Solar Radiation Rate per Area(Environment)'] = max(0, disturbance['Site Direct Solar Radiation Rate per Area(Environment)'])
+        
+        # set 'Zone People Occupant Count(SPACE1-1)' to people_count
+        disturbance['Zone People Occupant Count(SPACE1-1)'] = people_count
+
+        input_vars = ['time',
+                  'Site Outdoor Air Drybulb Temperature(Environment)',
+                  'Site Outdoor Air Relative Humidity(Environment)',
+                  'Site Wind Speed(Environment)',
+                  'Site Direct Solar Radiation Rate per Area(Environment)',
+                  'Zone People Occupant Count(SPACE1-1)',]
+    
+
+        obs_in = [current_step % 96 / 4]
+        for col in input_vars[1:]:
+            obs_in.append(disturbance[col])
+        obs_in.append(zone_temp)
+
+        action = tree.predict([obs_in])[0]
+
+        new_action_mapping = {
+            0: (15, 30),
+            1: (16, 29),
+            2: (17, 28),
+            3: (18, 27),
+            4: (19, 26),
+            5: (20, 25),
+            6: (21, 24),
+            7: (22, 23),
+            8: (22, 22),
+            9: (21, 21)
+        }
+
+        for i in new_action_mapping.keys():
+            if new_action_mapping[i][0] == int(action):
+                action = i
+                break
+
+        environment_var = ['Site Outdoor Air Drybulb Temperature(Environment)', 
+                           'Site Outdoor Air Relative Humidity(Environment)', 
+                           'Site Wind Speed(Environment)', 
+                           'Site Direct Solar Radiation Rate per Area(Environment)', 
+                           'Zone People Occupant Count(SPACE1-1)']
+
+        environment_forecast_vector = np.array([disturbance[var] for var in environment_var]).reshape(1, -1)
+        zone_temperature_vector = np.array([zone_temp]).reshape(1, -1)
+        heating_setpoint = new_action_mapping[action][0]
+        cooling_setpoint = new_action_mapping[action][1]
+        action_vector = np.array([heating_setpoint, cooling_setpoint]).reshape(1, -1)
+
+        state_vector = np.concatenate([environment_forecast_vector, zone_temperature_vector, action_vector], axis=1)
+
+        next_zone_temperature = model_predict_fn(state_vector, model_path)
+
+        if (next_zone_temperature < 23.5) and (next_zone_temperature > 20.0):
+            verified = 1
+        else:
+            verified = 0
+
+        df.append([current_step % 96 / 4, 
+                disturbance['Site Outdoor Air Drybulb Temperature(Environment)'],
+                disturbance['Site Outdoor Air Relative Humidity(Environment)'],
+                disturbance['Site Wind Speed(Environment)'],
+                disturbance['Site Direct Solar Radiation Rate per Area(Environment)'],
+                disturbance['Zone People Occupant Count(SPACE1-1)'],
+                obs,
+                verified])
+
+        # a csv file already exists at the save_path, append to it
+        if os.path.exists(save_path):
+            df_csv = pd.DataFrame(df, 
+                            columns=['time',
+                            'Site Outdoor Air Drybulb Temperature(Environment)',
+                            'Site Outdoor Air Relative Humidity(Environment)',
+                            'Site Wind Speed(Environment)',
+                            'Site Direct Solar Radiation Rate per Area(Environment)',
+                            'Zone People Occupant Count(SPACE1-1)',
+                            'Zone Air Temperature(SPACE1-1)', 
+                            'verified'])
+            df_csv.to_csv(save_path, mode='a', header=False)
+        # a csv file does not exist at the save_path, create it
+        else:
+            df_csv = pd.DataFrame(df, 
+                                columns=['time',
+                                'Site Outdoor Air Drybulb Temperature(Environment)',
+                                'Site Outdoor Air Relative Humidity(Environment)',
+                                'Site Wind Speed(Environment)',
+                                'Site Direct Solar Radiation Rate per Area(Environment)',
+                                'Zone People Occupant Count(SPACE1-1)',
+                                'Zone Air Temperature(SPACE1-1)', 
+                                'verified'])
+            df_csv.to_csv(save_path)
+
+
+def run(data_path, size, model_path):
+
+    columns = ['size',
+                'result']
+    
+    final_return = [size]
+
+    '''
+    learn decision tree
+    '''
+    def warn(*args, **kwargs):
+        pass
+    import warnings
+    warnings.warn = warn
+    from sklearn.tree import plot_tree
+    from sklearn.tree import DecisionTreeClassifier
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import accuracy_score
+    import pandas as pd
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # Load data
+    data = pd.read_csv(data_path+'_policy.csv')
+
+    # only take size number of samples
+    data = data.iloc[:size]
+
+    '''
+    X = data.drop(columns=['action'])
+    y = data['action']
+    '''
+    from sklearn.tree import export_graphviz
+
+    X = data.drop(columns=['action'])
+    y = data['action']
+
+    clf = DecisionTreeClassifier()
+    clf.fit(X, y)
+
+    import pickle
+    with open('temp_tree.pkl', 'wb') as f:
+        pickle.dump(clf, f)
+
+
+
+    probabilistic_verify(0.01, 1000, clf, model_path, 'verification_result_pittsburgh.csv')
+
+    # count the number of verified samples
+    # Load the verification result
+    df = pd.read_csv('verification_result_pittsburgh.csv')
+
+    # count the number of verified samples
+    verified = df[df['verified'] == 1]
+    print('Verified samples: {}'.format(verified.shape[0]))
+    
+    final_return.append(verified.shape[0])
+
+    # overwrite 'verification_result_pittsburgh.csv' with an empty csv file
+    df = pd.DataFrame(columns=['time',
+                            'Site Outdoor Air Drybulb Temperature(Environment)',
+                            'Site Outdoor Air Relative Humidity(Environment)',
+                            'Site Wind Speed(Environment)',
+                            'Site Direct Solar Radiation Rate per Area(Environment)',
+                            'Zone People Occupant Count(SPACE1-1)',
+                            'Zone Air Temperature(SPACE1-1)', 
+                            'verified'])
+    df.to_csv('verification_result_pittsburgh.csv')
+
+    return final_return
+
+# Load data
+data_path = 'IP_decisions_2/IP_decisions_noise=0.01_model=1200'
+verify_data = []
+for size in range(10, 1000, 50):
+    verify_data.append(run(data_path, size, 'zmodels/model_pittsburgh_winter_1200.pth'))
+    verify_data_csv = pd.DataFrame(verify_data, columns=['size',
+                                                    'result'])
+    verify_data_csv.to_csv('verify_data_pittsburgh.csv')
